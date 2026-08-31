@@ -1,0 +1,1740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ASG Service Portal</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    * { box-sizing: border-box; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { animation: spin 0.8s linear infinite; }
+  </style>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+    const UA_RED = "#9D2235";
+
+    // ── Your deployed Apps Script URL ─────────────────────────────────────────
+    const API_URL = "https://script.google.com/macros/s/AKfycbx2G8QjEDRMWeTKX4IFW2-hkIAbFSOOjDXzOvGfWhyPc6yzAKBohBxanqbtJLqnl38-pg/exec";
+
+    // ── Date helper ───────────────────────────────────────────────────────────
+    // Converts "2026-04-23" (from date input) → "April 23, 2026"
+    function formatDate(isoDate) {
+      if (!isoDate) return "";
+      const [y, m, d] = isoDate.split("-").map(Number);
+      return new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+    }
+
+    // ── API helpers ───────────────────────────────────────────────────────────
+    async function apiGet(action, params = {}) {
+      const url = new URL(API_URL);
+      url.searchParams.set("action", action);
+      Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+      const res = await fetch(url.toString());
+      return res.json();
+    }
+
+    // Uses text/plain to avoid CORS preflight issues with Apps Script
+    async function apiPost(payload) {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify(payload),
+      });
+      return res.json();
+    }
+
+    // ── Shared UI ─────────────────────────────────────────────────────────────
+    function Spinner({ size = 20 }) {
+      return (
+        <svg className="spinner" width={size} height={size} viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="#e5e7eb" strokeWidth="3" />
+          <path d="M12 2a10 10 0 0 1 10 10" stroke={UA_RED} strokeWidth="3" strokeLinecap="round" />
+        </svg>
+      );
+    }
+
+    function LoadingScreen({ message = "Loading..." }) {
+      return (
+        <div className="flex flex-col items-center justify-center py-24 gap-4 text-gray-400">
+          <Spinner size={32} />
+          <p className="text-sm">{message}</p>
+        </div>
+      );
+    }
+
+    function ErrorBanner({ message, onRetry }) {
+      return (
+        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-center justify-between gap-3 my-4">
+          <p className="text-sm text-red-700">{message}</p>
+          {onRetry && (
+            <button onClick={onRetry} className="text-xs font-semibold text-red-700 underline whitespace-nowrap">
+              Retry
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    function Toast({ message, color, onDone }) {
+      useEffect(() => {
+        const t = setTimeout(onDone, 3000);
+        return () => clearTimeout(t);
+      }, []);
+      return (
+        <div className="fixed top-4 right-4 z-50 px-4 py-3 rounded-xl text-white text-sm font-semibold shadow-lg"
+          style={{ backgroundColor: color || "#22c55e" }}>
+          {message}
+        </div>
+      );
+    }
+
+    function Badge({ type }) {
+      const isAsg = type === "asg";
+      return (
+        <span style={{ backgroundColor: isAsg ? "#FFF0F2" : "#F0F7FF", color: isAsg ? UA_RED : "#1a56db", border: `1px solid ${isAsg ? "#fcd5da" : "#c3dafe"}` }}
+          className="text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap">
+          {isAsg ? "ASG Hours" : "Service Hours"}
+        </span>
+      );
+    }
+
+    function SpotsBar({ filled, total }) {
+      const f = Number(filled), t = Number(total);
+      const pct = Math.min((f / t) * 100, 100);
+      const full = f >= t;
+      return (
+        <div>
+          <div className="flex justify-between text-xs text-gray-500 mb-1">
+            <span>{full ? "Full" : `${t - f} spot${t - f !== 1 ? "s" : ""} left`}</span>
+            <span>{f}/{t}</span>
+          </div>
+          <div className="w-full bg-gray-100 rounded-full h-1.5">
+            <div className="h-1.5 rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: full ? "#9ca3af" : UA_RED }} />
+          </div>
+        </div>
+      );
+    }
+
+    // ── Home ──────────────────────────────────────────────────────────────────
+    function HomeView({ setView }) {
+      const [opps, setOpps] = useState([]);
+      const [loadingOpps, setLoadingOpps] = useState(true);
+
+      useEffect(() => {
+        apiGet("getOpportunities").then(res => {
+          if (res.success) {
+            // Parent opps only, sorted soonest first
+            const parents = res.data.filter(o => !o.parentId || String(o.parentId) === "");
+            parents.sort((a, b) => new Date(a.date) - new Date(b.date));
+            setOpps(parents);
+          }
+        }).catch(() => {}).finally(() => setLoadingOpps(false));
+      }, []);
+
+      const preview = opps.slice(0, 3);
+
+      return (
+        <div className="flex flex-col items-center gap-10 py-16 px-4 max-w-2xl mx-auto text-center">
+          <div>
+            <h1 className="text-5xl font-bold text-gray-900 mb-4 leading-tight">Need hours?</h1>
+            <p className="text-gray-500 text-base leading-relaxed max-w-md mx-auto">
+              ASG hours and community service, all in one place. Find your name and claim a spot.
+            </p>
+          </div>
+
+          {/* Live opportunities card */}
+          <div className="w-full bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+            <div className="flex items-center justify-between px-6 pt-5 pb-3">
+              <p className="font-bold text-gray-900 text-base">
+                {loadingOpps ? "Loading..." : `${opps.length} opportunit${opps.length !== 1 ? "ies" : "y"} open`}
+              </p>
+              <p className="text-xs text-gray-400">updated today</p>
+            </div>
+            <div className="divide-y divide-gray-50 px-6">
+              {loadingOpps ? (
+                <div className="py-6"><LoadingScreen /></div>
+              ) : preview.length === 0 ? (
+                <div className="py-6 text-center text-gray-400 text-sm">No open opportunities right now — check back soon.</div>
+              ) : preview.map(opp => {
+                const spotsLeft = Number(opp.spotsTotal) - Number(opp.spotsFilled);
+                const full = spotsLeft <= 0 && Number(opp.spotsTotal) > 0;
+                const hasShifts = String(opp.time).toLowerCase().includes("shift");
+                const spotsColor = full ? "#9ca3af" : spotsLeft <= 3 ? "#d97706" : "#16a34a";
+                return (
+                  <div key={opp.id} className="py-3.5 flex items-center justify-between gap-4">
+                    <div className="text-left min-w-0">
+                      <p className="font-semibold text-sm text-gray-900 truncate">{opp.title}</p>
+                      <p className="text-xs text-gray-400 mt-0.5">{opp.date} · {opp.hours > 0 ? `${opp.hours} ` : ""}{opp.type === "asg" ? "ASG" : "service"} hr{Number(opp.hours) !== 1 ? "s" : ""}</p>
+                    </div>
+                    <span className="text-sm font-bold shrink-0" style={{ color: spotsColor }}>
+                      {hasShifts ? "Multiple shifts" : full ? "Full" : `${spotsLeft} spot${spotsLeft !== 1 ? "s" : ""} left`}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="px-6 pb-6 pt-3">
+              <button onClick={() => setView("browse")}
+                className="w-full py-3 rounded-xl text-sm font-bold text-white transition-opacity hover:opacity-90"
+                style={{ backgroundColor: UA_RED }}>
+                Browse all {opps.length} →
+              </button>
+            </div>
+          </div>
+
+          {/* Footer links */}
+          <div className="flex gap-5">
+            <button onClick={() => setView("staff")} className="text-xs text-gray-400 hover:text-gray-600 underline underline-offset-2">FLF Staff</button>
+            <button onClick={() => setView("admin")} className="text-xs text-gray-400 hover:text-gray-600 underline underline-offset-2">Admin</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Outside Hours Modal ───────────────────────────────────────────────────
+    function OutsideHoursModal({ onClose, onSubmit, flfMembers }) {
+      const [form, setForm] = useState({ flfName: "", email: "", description: "", correspondent: "", type: "" });
+      const [submitting, setSubmitting] = useState(false);
+      const isFlf = !!form.flfName;
+      const disabled = !isFlf;
+      const valid = isFlf && form.email && form.correspondent && form.type;
+      const ic = `w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300${disabled ? " bg-gray-50 text-gray-300 cursor-not-allowed" : ""}`;
+      const lc = "text-xs font-semibold text-gray-600 block mb-1";
+
+      const handleSubmit = async () => {
+        if (!valid || submitting) return;
+        setSubmitting(true);
+        await onSubmit({ ...form, name: form.flfName, isFlf: true });
+        setSubmitting(false);
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md max-h-[90vh] overflow-y-auto">
+            <h3 className="font-bold text-lg text-gray-900 mb-1">Add Outside Hours</h3>
+            <p className="text-sm text-gray-500 mb-4">Did service outside the portal? Submit it here for approval.</p>
+            <div className="space-y-3">
+              <div>
+                <label className={lc}>Select your FLF name</label>
+                <select className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300 bg-white"
+                  value={form.flfName} onChange={e => setForm(f => ({ ...f, flfName: e.target.value }))}>
+                  <option value="">-- Select your name to continue --</option>
+                  {(flfMembers || []).map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </div>
+              {!isFlf && <p className="text-xs text-gray-400 text-center">Select your name above to fill out this form.</p>}
+              <div className={`space-y-3 transition-opacity ${disabled ? "opacity-40 pointer-events-none" : ""}`}>
+                <div>
+                  <label className={lc}>Your UARK Email</label>
+                  <input className={ic} placeholder="yourname@uark.edu" disabled={disabled} value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+                </div>
+                <div>
+                  <label className={lc}>Description <span className="font-normal text-gray-400">(optional)</span></label>
+                  <textarea className={`${ic} resize-none`} rows={2} placeholder="What did you do? Where? Any details that help with approval."
+                    disabled={disabled} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />
+                </div>
+                <div>
+                  <label className={lc}>Correspondent Name / Small Group Leader</label>
+                  <input className={ic} placeholder="Name of someone who can verify this" disabled={disabled} value={form.correspondent} onChange={e => setForm(f => ({ ...f, correspondent: e.target.value }))} />
+                </div>
+                <div>
+                  <label className={lc}>Submit as</label>
+                  <div className="flex gap-2">
+                    {["asg", "service"].map(t => {
+                      const selected = form.type === t;
+                      return (
+                        <button key={t} onClick={() => !disabled && setForm(f => ({ ...f, type: t }))}
+                          className="flex-1 py-2 rounded-xl text-sm font-semibold border transition-all"
+                          style={{ backgroundColor: selected ? (t === "asg" ? "#FFF0F2" : "#F0F7FF") : "white", color: selected ? (t === "asg" ? UA_RED : "#1a56db") : "#9ca3af", borderColor: selected ? (t === "asg" ? "#fcd5da" : "#c3dafe") : "#e5e7eb" }}>
+                          {t === "asg" ? "ASG Hours" : "Service Hours"}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-3 mt-5">
+              <button onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border border-gray-200 text-gray-700">Cancel</button>
+              <button onClick={handleSubmit} disabled={!valid || submitting}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2"
+                style={{ backgroundColor: UA_RED, opacity: !valid ? 0.5 : 1, cursor: !valid ? "not-allowed" : "pointer" }}>
+                {submitting ? <><Spinner size={16} /> Submitting...</> : "Submit"}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Browse ────────────────────────────────────────────────────────────────
+    function BrowseView({ setView, flfMembers }) {
+      const [opportunities, setOpportunities] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
+      const [filter, setFilter] = useState("all");
+      const [avail, setAvail] = useState("all");
+      const [signUpTarget, setSignUpTarget] = useState(null);
+      const [showOutsideModal, setShowOutsideModal] = useState(false);
+      const [form, setForm] = useState({ flfName: "", email: "" });
+      const [submitting, setSubmitting] = useState(false);
+      const [confirmed, setConfirmed] = useState(null);
+      const [toast, setToast] = useState(null);
+
+      const load = useCallback(async () => {
+        setLoading(true); setError(null);
+        try {
+          const res = await apiGet("getOpportunities");
+          if (res.success) setOpportunities(res.data);
+          else setError(res.error || "Failed to load opportunities.");
+        } catch (e) {
+          setError("Could not connect. Check your internet connection.");
+        } finally {
+          setLoading(false);
+        }
+      }, []);
+
+      useEffect(() => { load(); }, [load]);
+
+      // Separate parents, children, and regular opps
+      const childOpps = opportunities.filter(o => o.parentId && String(o.parentId) !== "");
+      const parentOpps = opportunities.filter(o => !o.parentId || String(o.parentId) === "");
+      const getShifts = (parentId) => childOpps.filter(c => String(c.parentId) === String(parentId));
+
+      const parseOppDate = (str) => { try { return new Date(str); } catch { return null; } };
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const nextWeek = new Date(today); nextWeek.setDate(today.getDate() + 7);
+
+      const asgCount = parentOpps.filter(o => o.type === "asg").length;
+      const serviceCount = parentOpps.filter(o => o.type === "service").length;
+
+      const applyFilters = (opps) => {
+        let result = filter === "all" ? opps : opps.filter(o => o.type === filter);
+        if (avail === "hasSpots") result = result.filter(o => {
+          const shifts = getShifts(o.id);
+          return shifts.length > 0
+            ? shifts.some(s => Number(s.spotsFilled) < Number(s.spotsTotal))
+            : Number(o.spotsFilled) < Number(o.spotsTotal);
+        });
+        if (avail === "thisWeek") result = result.filter(o => {
+          const d = parseOppDate(o.date); return d && d >= today && d < nextWeek;
+        });
+        if (avail === "weekends") result = result.filter(o => {
+          const d = parseOppDate(o.date); return d && (d.getDay() === 0 || d.getDay() === 6);
+        });
+        return result.sort((a, b) => (parseOppDate(a.date) || 0) - (parseOppDate(b.date) || 0));
+      };
+
+      const filtered = applyFilters(parentOpps);
+
+      const handleSignUp = async () => {
+        const name = form.flfName || form.customName;
+        if (!name || !form.email) return;
+        setSubmitting(true);
+        try {
+          const res = await apiPost({
+            action: "signup",
+            opportunityId: signUpTarget.id,
+            opportunityTitle: signUpTarget.title,
+            name,
+            email: form.email,
+            isFlf: form.flfName ? "TRUE" : "FALSE",
+          });
+          if (res.success) {
+            setConfirmed(signUpTarget);
+            setSignUpTarget(null);
+            setForm({ flfName: "", email: "" });
+            load(); // refresh spot counts
+          } else {
+            setToast({ message: res.error, color: "#ef4444" });
+            setSignUpTarget(null);
+          }
+        } catch (e) {
+          setToast({ message: "Something went wrong. Please try again.", color: "#ef4444" });
+        } finally {
+          setSubmitting(false);
+        }
+      };
+
+      const handleOutsideHours = async (outsideForm) => {
+        try {
+          const res = await apiPost({
+            action: "submitOutsideHours",
+            name: outsideForm.name,
+            email: outsideForm.email,
+            description: outsideForm.description,
+            correspondent: outsideForm.correspondent,
+            type: outsideForm.type,
+            isFlf: outsideForm.isFlf ? "TRUE" : "FALSE",
+            timestamp: new Date().toLocaleString(),
+          });
+          if (res.success) {
+            setShowOutsideModal(false);
+            setToast({ message: "Submitted! The service team will review and credit your hours.", color: "#22c55e" });
+          } else {
+            setToast({ message: res.error || "Something went wrong.", color: "#ef4444" });
+            setShowOutsideModal(false);
+          }
+        } catch (e) {
+          setToast({ message: "Could not connect. Please try again.", color: "#ef4444" });
+          setShowOutsideModal(false);
+        }
+      };
+
+      if (confirmed) {
+        return (
+          <div className="flex flex-col items-center gap-6 py-16 px-4 max-w-md mx-auto text-center">
+            <div className="w-16 h-16 rounded-full flex items-center justify-center font-bold text-2xl" style={{ backgroundColor: "#F0FFF4", color: "#16a34a" }}>✓</div>
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900 mb-2">You're signed up!</h2>
+              <p className="text-gray-500 text-sm leading-relaxed">
+                You're registered for <strong>{confirmed.title}</strong> on {confirmed.date}. Show up and your hours will be validated after the event.
+              </p>
+            </div>
+            <div className="bg-gray-50 rounded-xl p-4 text-left w-full text-sm text-gray-600 space-y-1">
+              <div><span className="font-medium">Date:</span> {confirmed.date}</div>
+              <div><span className="font-medium">Time:</span> {confirmed.time}</div>
+              <div><span className="font-medium">Location:</span> {confirmed.location}</div>
+              <div><span className="font-medium">Hours:</span> {confirmed.hours}</div>
+            </div>
+            <div className="flex gap-3 w-full">
+              <button onClick={() => setConfirmed(null)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border border-gray-200 text-gray-700 hover:bg-gray-50">Browse More</button>
+              <button onClick={() => setView("home")} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white" style={{ backgroundColor: UA_RED }}>Go Home</button>
+            </div>
+          </div>
+        );
+      }
+
+      const SidebarBtn = ({ active, onClick, children }) => (
+        <button onClick={onClick} className="w-full text-left px-3 py-2 rounded-xl text-sm font-semibold transition-all"
+          style={{ backgroundColor: active ? "#111827" : "transparent", color: active ? "white" : "#6b7280" }}>
+          {children}
+        </button>
+      );
+
+      return (
+        <div style={{ display: "flex", maxWidth: 960, margin: "0 auto" }}>
+          {toast && <Toast message={toast.message} color={toast.color} onDone={() => setToast(null)} />}
+          {showOutsideModal && <OutsideHoursModal onClose={() => setShowOutsideModal(false)} onSubmit={handleOutsideHours} flfMembers={flfMembers} />}
+
+          {signUpTarget && (
+            <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+              <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md">
+                <h3 className="font-bold text-lg text-gray-900 mb-1">Sign up for</h3>
+                <p className="text-gray-600 text-sm mb-4">{signUpTarget.title} · {signUpTarget.date}</p>
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-xs font-semibold text-gray-600 block mb-1">Are you in FLF? Select your name</label>
+                    <select className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300 bg-white"
+                      value={form.flfName} onChange={e => setForm(f => ({ ...f, flfName: e.target.value, customName: "" }))}>
+                      <option value="">-- Not in FLF / Enter name below --</option>
+                      {(flfMembers || []).map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                  {!form.flfName && (
+                    <div>
+                      <label className="text-xs font-semibold text-gray-600 block mb-1">Full Name</label>
+                      <input className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300"
+                        placeholder="Your name" value={form.customName || ""} onChange={e => setForm(f => ({ ...f, customName: e.target.value }))} />
+                    </div>
+                  )}
+                  {form.flfName && (
+                    <div className="px-3 py-2 bg-red-50 border border-red-100 rounded-xl text-sm text-gray-700">
+                      Signing up as <strong>{form.flfName}</strong>
+                    </div>
+                  )}
+                  <div>
+                    <label className="text-xs font-semibold text-gray-600 block mb-1">UARK Email</label>
+                    <input className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300"
+                      placeholder="yourname@uark.edu" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+                  </div>
+                </div>
+                <div className="flex gap-3 mt-5">
+                  <button onClick={() => setSignUpTarget(null)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border border-gray-200 text-gray-700">Cancel</button>
+                  <button onClick={handleSignUp} disabled={!(form.flfName || form.customName) || !form.email || submitting}
+                    className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2"
+                    style={{ backgroundColor: UA_RED, opacity: (!(form.flfName || form.customName) || !form.email) ? 0.5 : 1 }}>
+                    {submitting ? <><Spinner size={16} /> Signing up...</> : "Confirm"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Sticky Sidebar ── */}
+          <div style={{ width: 200, flexShrink: 0, position: "sticky", top: 56, height: "calc(100vh - 56px)", overflowY: "auto", padding: "28px 12px", borderRight: "1px solid #f3f4f6" }}>
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 px-3">Filter</p>
+            <div className="space-y-0.5 mb-5">
+              <SidebarBtn active={filter === "all" && avail === "all"} onClick={() => { setFilter("all"); setAvail("all"); }}>
+                All · {parentOpps.length}
+              </SidebarBtn>
+              <SidebarBtn active={filter === "asg"} onClick={() => { setFilter("asg"); setAvail("all"); }}>
+                ASG hours · {asgCount}
+              </SidebarBtn>
+              <SidebarBtn active={filter === "service"} onClick={() => { setFilter("service"); setAvail("all"); }}>
+                Service hours · {serviceCount}
+              </SidebarBtn>
+            </div>
+
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 px-3">Availability</p>
+            <div className="space-y-0.5 mb-6">
+              {[["hasSpots", "Has spots"], ["thisWeek", "This week"], ["weekends", "Weekends"]].map(([id, label]) => (
+                <SidebarBtn key={id} active={avail === id} onClick={() => setAvail(avail === id ? "all" : id)}>
+                  {label}
+                </SidebarBtn>
+              ))}
+            </div>
+
+            <button onClick={() => setShowOutsideModal(true)}
+              className="w-full text-left px-3 py-2 rounded-xl text-sm font-semibold border border-gray-200 text-gray-600 hover:bg-gray-50 transition-all">
+              Log outside hours
+            </button>
+          </div>
+
+          {/* ── Main content ── */}
+          <div style={{ flex: 1, padding: "28px 28px", minWidth: 0 }}>
+            <div className="mb-5">
+              <h2 className="text-2xl font-bold text-gray-900">What's open</h2>
+              {!loading && (
+                <p className="text-sm text-gray-400 mt-0.5">
+                  Sorted by soonest · {filtered.reduce((a, o) => a + Math.max(0, Number(o.spotsTotal) - Number(o.spotsFilled)), 0)} spots total
+                </p>
+              )}
+            </div>
+
+            {loading && <LoadingScreen message="Fetching opportunities..." />}
+            {error && <ErrorBanner message={error} onRetry={load} />}
+
+            {!loading && !error && (
+              <div className="space-y-3">
+                {filtered.length === 0 ? (
+                  <div className="text-center py-16 text-gray-400">
+                    <p className="font-medium">No opportunities match this filter</p>
+                    <p className="text-sm mt-1">Try a different filter or check back soon.</p>
+                  </div>
+                ) : filtered.map(opp => {
+                  const shifts = getShifts(opp.id);
+                  const hasShifts = shifts.length > 0;
+                  const spotsLeft = Number(opp.spotsTotal) - Number(opp.spotsFilled);
+                  const full = !hasShifts && spotsLeft <= 0;
+                  const spotsColor = full ? "#9ca3af" : spotsLeft <= 3 ? "#d97706" : "#16a34a";
+                  const pct = Number(opp.spotsTotal) > 0 ? Math.min(Number(opp.spotsFilled) / Number(opp.spotsTotal) * 100, 100) : 0;
+
+                  return (
+                    <div key={opp.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-shadow">
+                      {/* Main row */}
+                      <div className="flex items-start gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
+                            <h3 className="font-semibold text-gray-900 text-base leading-snug">{opp.title}</h3>
+                            <Badge type={opp.type} />
+                            {!hasShifts && opp.hours > 0 && (
+                              <span className="text-xs text-gray-400 font-medium">{opp.hours} hr{Number(opp.hours) !== 1 ? "s" : ""}</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-400">
+                            {opp.date}{opp.time && !hasShifts ? ` · ${opp.time}` : ""} · {opp.location}
+                          </p>
+                          {opp.description && <p className="text-sm text-gray-500 mt-2 leading-relaxed">{opp.description}</p>}
+                        </div>
+
+                        {!hasShifts && (
+                          <div className="shrink-0 flex flex-col items-end gap-2" style={{ minWidth: 140 }}>
+                            <div className="text-right">
+                              <p className="text-sm font-bold" style={{ color: spotsColor }}>
+                                {full ? "Full" : `${spotsLeft} left`}
+                              </p>
+                              <p className="text-xs text-gray-400">{opp.spotsFilled} of {opp.spotsTotal}</p>
+                            </div>
+                            <div className="w-full bg-gray-100 rounded-full h-1.5">
+                              <div className="h-1.5 rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: full ? "#9ca3af" : UA_RED }} />
+                            </div>
+                            <button onClick={() => !full && setSignUpTarget(opp)} disabled={full}
+                              className="w-full py-2 rounded-xl text-sm font-semibold transition-all"
+                              style={{ backgroundColor: full ? "#e5e7eb" : UA_RED, color: full ? "#9ca3af" : "white", cursor: full ? "not-allowed" : "pointer" }}>
+                              {full ? "Full" : "Sign up"}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Shifts section */}
+                      {hasShifts && (
+                        <div className="mt-3 space-y-2">
+                          <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Shifts — 1 hr each</p>
+                          {shifts.map(shift => {
+                            const shiftLeft = Number(shift.spotsTotal) - Number(shift.spotsFilled);
+                            const shiftFull = shiftLeft <= 0;
+                            const shiftPct = Number(shift.spotsTotal) > 0 ? Math.min(Number(shift.spotsFilled) / Number(shift.spotsTotal) * 100, 100) : 0;
+                            return (
+                              <div key={shift.id} className="flex items-center gap-3 bg-gray-50 rounded-xl px-3 py-2">
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm font-medium text-gray-700">{shift.time}</p>
+                                  <div className="flex items-center gap-2 mt-1">
+                                    <div className="flex-1 bg-gray-200 rounded-full h-1">
+                                      <div className="h-1 rounded-full" style={{ width: `${shiftPct}%`, backgroundColor: shiftFull ? "#9ca3af" : UA_RED }} />
+                                    </div>
+                                    <span className="text-xs font-semibold" style={{ color: shiftFull ? "#9ca3af" : "#16a34a" }}>
+                                      {shiftFull ? "Full" : `${shiftLeft} left`}
+                                    </span>
+                                  </div>
+                                </div>
+                                <button onClick={() => !shiftFull && setSignUpTarget(shift)} disabled={shiftFull}
+                                  className="text-xs font-semibold px-3 py-1.5 rounded-lg transition-all whitespace-nowrap"
+                                  style={{ backgroundColor: shiftFull ? "#e5e7eb" : UA_RED, color: shiftFull ? "#9ca3af" : "white", cursor: shiftFull ? "not-allowed" : "pointer" }}>
+                                  {shiftFull ? "Full" : "Sign up"}
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Request ───────────────────────────────────────────────────────────────
+    function RequestView({ setView }) {
+      const [form, setForm] = useState({ title: "", description: "", date: "", time: "", location: "", spots: "", name: "", email: "" });
+      const [submitting, setSubmitting] = useState(false);
+      const [submitted, setSubmitted] = useState(false);
+      const [error, setError] = useState(null);
+
+      const valid = form.title && form.description && form.date && form.time && form.location && form.spots && form.name && form.email;
+
+      const handleSubmit = async () => {
+        if (!valid) return;
+        setSubmitting(true); setError(null);
+        try {
+          const res = await apiPost({
+            action: "submitRequest",
+            title: form.title,
+            description: form.description,
+            date: formatDate(form.date),
+            time: form.time,
+            location: form.location,
+            spotsNeeded: form.spots,
+            submittedBy: form.name,
+            contact: form.email,
+            hours: 2,
+          });
+          if (res.success) setSubmitted(true);
+          else setError(res.error || "Something went wrong.");
+        } catch (e) {
+          setError("Could not connect. Please try again.");
+        } finally {
+          setSubmitting(false);
+        }
+      };
+
+      const inputCls = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300";
+      const labelCls = "text-xs font-semibold text-gray-600 block mb-1";
+
+      if (submitted) {
+        return (
+          <div className="flex flex-col items-center gap-6 py-16 px-4 max-w-md mx-auto text-center">
+            <div className="w-16 h-16 rounded-full flex items-center justify-center text-3xl" style={{ backgroundColor: "#F0FFF4" }}>📬</div>
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900 mb-2">Request submitted!</h2>
+              <p className="text-gray-500 text-sm leading-relaxed">The service team will review your request and post it to the portal. You'll be notified once it goes live.</p>
+            </div>
+            <button onClick={() => setView("home")} className="w-full py-2.5 rounded-xl text-sm font-semibold text-white" style={{ backgroundColor: UA_RED }}>Back to Home</button>
+          </div>
+        );
+      }
+
+      return (
+        <div className="max-w-lg mx-auto px-4 py-8">
+          <div className="mb-6">
+            <h2 className="text-2xl font-bold text-gray-900">Request Help</h2>
+            <p className="text-sm text-gray-500 mt-1">Tell us about your event and how members can help. The service team will review and post it.</p>
+          </div>
+          {error && <ErrorBanner message={error} />}
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 space-y-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-widest">Event Details</p>
+            <div>
+              <label className={labelCls}>Event Title</label>
+              <input className={inputCls} placeholder="e.g. Senate Meeting Check-In Help"
+                value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} />
+            </div>
+            <div>
+              <label className={labelCls}>Description</label>
+              <textarea className={`${inputCls} resize-none`} rows={3}
+                placeholder="What will members be doing? Any details they should know."
+                value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />
+            </div>
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <label className={labelCls}>Date</label>
+                <input type="date" className={inputCls}
+                  value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
+              </div>
+              <div className="flex-1">
+                <label className={labelCls}>Time</label>
+                <input className={inputCls} placeholder="e.g. 6:00–8:00 PM"
+                  value={form.time} onChange={e => setForm(f => ({ ...f, time: e.target.value }))} />
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <label className={labelCls}>Location</label>
+                <input className={inputCls} placeholder="e.g. ARKU 401"
+                  value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} />
+              </div>
+              <div className="flex-1">
+                <label className={labelCls}>Volunteers Needed</label>
+                <input type="number" className={inputCls} placeholder="e.g. 3"
+                  value={form.spots} onChange={e => setForm(f => ({ ...f, spots: e.target.value }))} />
+              </div>
+            </div>
+            <div className="pt-2 border-t border-gray-100">
+              <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-4">Your Info</p>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label className={labelCls}>Your Name</label>
+                  <input className={inputCls} placeholder="Full name"
+                    value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+                </div>
+                <div className="flex-1">
+                  <label className={labelCls}>Your Email</label>
+                  <input className={inputCls} placeholder="yourname@uark.edu"
+                    value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+                </div>
+              </div>
+            </div>
+            <button onClick={handleSubmit} disabled={!valid || submitting}
+              className="w-full py-3 rounded-xl text-sm font-semibold text-white mt-2 flex items-center justify-center gap-2"
+              style={{ backgroundColor: UA_RED, opacity: (!valid || submitting) ? 0.6 : 1, cursor: !valid ? "not-allowed" : "pointer" }}>
+              {submitting ? <><Spinner size={16} /> Submitting...</> : "Submit Request"}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+    function AdminView() {
+      const [authed, setAuthed] = useState(false);
+      const [pw, setPw] = useState("");
+      const [tab, setTab] = useState("active");
+      const [opportunities, setOpportunities] = useState([]);
+      const [validated, setValidated] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState(null);
+      const [toast, setToast] = useState(null);
+      const [validateTarget, setValidateTarget] = useState(null);
+      const [signups, setSignups] = useState([]);
+      const [actionLoading, setActionLoading] = useState(null);
+      const [showPostModal, setShowPostModal] = useState(false);
+
+      const showToast = (msg, color = "#22c55e") => setToast({ message: msg, color });
+
+      const loadAll = useCallback(async () => {
+        setLoading(true); setError(null);
+        try {
+          const [o, v] = await Promise.all([
+            apiGet("getOpportunities"),
+            apiGet("getValidated"),
+          ]);
+          if (o.success) setOpportunities(o.data);
+          if (v.success) setValidated(v.data);
+          if (!o.success) setError("Failed to load some data.");
+        } catch (e) {
+          setError("Could not connect to the sheet.");
+        } finally {
+          setLoading(false);
+        }
+      }, []);
+
+      useEffect(() => { if (authed) loadAll(); }, [authed, loadAll]);
+
+      const openValidate = async (opp) => {
+        setValidateTarget(opp);
+        try {
+          const res = await apiGet("getSignups", { opportunityId: opp.id });
+          if (res.success) setSignups(res.data);
+        } catch (e) { setSignups([]); }
+      };
+
+      const handleValidate = async (checkedSignups) => {
+        setActionLoading("validate");
+        try {
+          const res = await apiPost({
+            action: "validate",
+            opportunityId: validateTarget.id,
+            opportunityTitle: validateTarget.title,
+            type: validateTarget.type,
+            hours: validateTarget.hours,
+            attendees: checkedSignups.map(s => ({ name: s.name, email: s.email })),
+          });
+          if (res.success) {
+            showToast(`Hours credited to ${checkedSignups.length} member${checkedSignups.length !== 1 ? "s" : ""}`);
+            setValidateTarget(null);
+            setSignups([]);
+            loadAll();
+          } else {
+            showToast(res.error, "#ef4444");
+          }
+        } finally { setActionLoading(null); }
+      };
+
+      const handlePost = async (form) => {
+        try {
+          const res = await apiPost({ action: "postOpportunity", ...form });
+          if (res.success) { showToast(`"${form.title}" posted live`); setShowPostModal(false); loadAll(); }
+          else showToast(res.error, "#ef4444");
+        } catch (e) { showToast("Failed to post.", "#ef4444"); }
+      };
+
+      if (!authed) {
+        return (
+          <div className="flex flex-col items-center gap-5 py-20 px-4 max-w-sm mx-auto text-center">
+            <div className="w-14 h-14 rounded-full flex items-center justify-center text-2xl" style={{ backgroundColor: "#FFF0F2" }}>🔐</div>
+            <div>
+              <h2 className="text-xl font-bold text-gray-900">Admin Access</h2>
+              <p className="text-sm text-gray-500 mt-1">Enter your password to continue.</p>
+            </div>
+            <input type="password" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300"
+              placeholder="Password" value={pw} onChange={e => setPw(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && pw === "flf2026" && setAuthed(true)} />
+            <button onClick={() => pw === "flf2026" && setAuthed(true)}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold text-white" style={{ backgroundColor: UA_RED }}>
+              Sign In
+            </button>
+            {pw && pw !== "flf2026" && <p className="text-xs text-red-500">Incorrect password</p>}
+            <p className="text-xs text-gray-300">hint: flf2026</p>
+          </div>
+        );
+      }
+
+      return (
+        <div className="max-w-2xl mx-auto px-4 py-6">
+          {toast && <Toast message={toast.message} color={toast.color} onDone={() => setToast(null)} />}
+          {validateTarget && <ValidateModal opp={validateTarget} signups={signups} loading={actionLoading === "validate"} onClose={() => { setValidateTarget(null); setSignups([]); }} onConfirm={handleValidate} />}
+          {showPostModal && <PostModal onClose={() => setShowPostModal(false)} onPost={handlePost} />}
+
+          <div className="flex items-center justify-between mb-6">
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900">Admin Panel</h2>
+              <p className="text-sm text-gray-500">ASG Director of Service</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={loadAll} className="p-2 rounded-xl border border-gray-200 hover:bg-gray-50" title="Refresh">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2.5" strokeLinecap="round"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>
+              </button>
+              <button onClick={() => setShowPostModal(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-white"
+                style={{ backgroundColor: UA_RED }}>
+                + Post Opportunity
+              </button>
+            </div>
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-2 gap-3 mb-5">
+            {[
+              { label: "Active", value: opportunities.length, icon: "📋", bg: "#F0F7FF", color: "#1a56db" },
+              { label: "Hours Logged", value: validated.reduce((a, v) => a + (Number(v.hours) || 0), 0), icon: "✅", bg: "#F0FFF4", color: "#16a34a" },
+            ].map((s, i) => (
+              <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-3 text-center">
+                <p className="text-xl mb-0.5">{s.icon}</p>
+                <p className="text-2xl font-bold" style={{ color: s.color }}>{loading ? "—" : s.value}</p>
+                <p className="text-xs text-gray-400 mt-0.5">{s.label}</p>
+              </div>
+            ))}
+          </div>
+
+          {error && <ErrorBanner message={error} onRetry={loadAll} />}
+
+          {/* Tabs */}
+          <div className="flex gap-1 bg-gray-100 rounded-xl p-1 text-sm font-semibold mb-5">
+            {[["active", `Active (${opportunities.length})`], ["validated", `Validated (${validated.length})`]].map(([id, label]) => (
+              <button key={id} onClick={() => setTab(id)} className="flex-1 py-2 rounded-lg transition-all"
+                style={{ backgroundColor: tab === id ? "white" : "transparent", color: tab === id ? UA_RED : "#6b7280", boxShadow: tab === id ? "0 1px 3px rgba(0,0,0,0.1)" : "none" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {loading && <LoadingScreen />}
+
+          {!loading && tab === "active" && (
+            <div className="space-y-3">
+              {opportunities.length === 0 ? (
+                <div className="text-center py-12 text-gray-400">
+                  <p className="text-3xl mb-2">📋</p><p className="font-medium">No active postings</p>
+                  <button onClick={() => setShowPostModal(true)} className="mt-2 text-sm font-semibold underline" style={{ color: UA_RED }}>Post one now</button>
+                </div>
+              ) : opportunities.map(opp => (
+                <div key={opp.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                  <div className="flex items-center justify-between gap-3 mb-2">
+                    <div className="flex items-center gap-2 flex-1 min-w-0">
+                      <p className="font-semibold text-sm text-gray-900 truncate">{opp.title}</p>
+                      <Badge type={opp.type} />
+                    </div>
+                    <button onClick={() => openValidate(opp)}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg text-white whitespace-nowrap"
+                      style={{ backgroundColor: UA_RED }}>
+                      Validate
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-400 mb-2">{opp.date} · {opp.time}</p>
+                  <SpotsBar filled={opp.spotsFilled} total={opp.spotsTotal} />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!loading && tab === "validated" && (
+            <div className="space-y-3">
+              {validated.length === 0 ? (
+                <div className="text-center py-12 text-gray-400"><p className="text-3xl mb-2">🏆</p><p className="font-medium">No validated hours yet</p></div>
+              ) : validated.map((v, i) => (
+                <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                  <div className="flex items-center justify-between mb-1">
+                    <p className="font-semibold text-sm text-gray-900">{v.opportunityTitle}</p>
+                    <Badge type={v.type} />
+                  </div>
+                  <p className="text-xs text-gray-400 mb-2">{v.validatedDate} · {v.hours} hr credited</p>
+                  <p className="text-sm text-gray-700">{v.name} <span className="text-gray-400">· {v.email}</span></p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── Validate Modal ────────────────────────────────────────────────────────
+    function ValidateModal({ opp, signups, loading, onClose, onConfirm }) {
+      const [checked, setChecked] = useState({});
+
+      useEffect(() => {
+        const init = {};
+        signups.forEach(s => { init[s.email] = true; });
+        setChecked(init);
+      }, [signups]);
+
+      const toggle = (email) => setChecked(prev => ({ ...prev, [email]: !prev[email] }));
+      const selected = signups.filter(s => checked[s.email]);
+
+      return (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md">
+            <h3 className="font-bold text-lg text-gray-900 mb-1">Validate Attendance</h3>
+            <p className="text-sm text-gray-500 mb-4">{opp.title} · {opp.hours} hr{Number(opp.hours) !== 1 ? "s" : ""} each</p>
+            {signups.length === 0 ? (
+              <p className="text-sm text-gray-400 text-center py-4">No sign-ups recorded for this event.</p>
+            ) : (
+              <div className="bg-gray-50 rounded-xl p-3 mb-4 space-y-2 max-h-56 overflow-y-auto">
+                <p className="text-xs font-semibold text-gray-400 mb-2">Signed Up ({signups.length}) — uncheck no-shows</p>
+                {signups.map(s => (
+                  <label key={s.email} className="flex items-center justify-between cursor-pointer">
+                    <span className="text-sm text-gray-700">{s.name} <span className="text-gray-400 text-xs">{s.email}</span></span>
+                    <input type="checkbox" checked={!!checked[s.email]} onChange={() => toggle(s.email)}
+                      className="w-4 h-4 rounded accent-red-700" />
+                  </label>
+                ))}
+              </div>
+            )}
+            <p className="text-xs text-gray-400 mb-4">{selected.length} of {signups.length} will receive hours.</p>
+            <div className="flex gap-3">
+              <button onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border border-gray-200 text-gray-700">Cancel</button>
+              <button onClick={() => onConfirm(selected)} disabled={loading || selected.length === 0}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2"
+                style={{ backgroundColor: UA_RED, opacity: selected.length === 0 ? 0.5 : 1 }}>
+                {loading ? <><Spinner size={14} /> Saving...</> : `Credit ${selected.length} member${selected.length !== 1 ? "s" : ""}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Post Modal ────────────────────────────────────────────────────────────
+    function PostModal({ onClose, onPost }) {
+      const [form, setForm] = useState({ type: "", title: "", description: "", date: "", time: "", location: "", spotsTotal: "", hours: "2" });
+      const [hasShifts, setHasShifts] = useState(false);
+      const [shifts, setShifts] = useState([{ time: "", spots: "" }]);
+      const ic = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300";
+      const lc = "text-xs font-semibold text-gray-600 block mb-1";
+
+      const shiftValid = hasShifts ? shifts.every(s => s.time && s.spots) && shifts.length > 0 : (form.time && form.spotsTotal);
+      const valid = form.type && form.title && form.date && form.location && shiftValid;
+
+      const addShift = () => setShifts(s => [...s, { time: "", spots: "" }]);
+      const removeShift = i => setShifts(s => s.filter((_, idx) => idx !== i));
+      const updateShift = (i, field, val) => setShifts(s => s.map((sh, idx) => idx === i ? { ...sh, [field]: val } : sh));
+
+      const handlePost = () => {
+        if (!valid) return;
+        const base = { ...form, date: formatDate(form.date) };
+        if (hasShifts) {
+          onPost({ ...base, time: "Multiple shifts", spotsTotal: 0, hours: 0, shifts: shifts.map(s => ({ time: s.time, spots: Number(s.spots) })) });
+        } else {
+          onPost(base);
+        }
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md max-h-[90vh] overflow-y-auto">
+            <h3 className="font-bold text-lg text-gray-900 mb-4">Post an Opportunity</h3>
+            <div className="space-y-3">
+              <div>
+                <label className={lc}>Tag as</label>
+                <div className="flex gap-2">
+                  {["asg", "service"].map(t => {
+                    const selected = form.type === t;
+                    return (
+                      <button key={t} onClick={() => setForm(f => ({ ...f, type: t }))}
+                        className="flex-1 py-2 rounded-xl text-sm font-semibold border transition-all"
+                        style={{ backgroundColor: selected ? (t === "asg" ? "#FFF0F2" : "#F0F7FF") : "white", color: selected ? (t === "asg" ? UA_RED : "#1a56db") : "#9ca3af", borderColor: selected ? (t === "asg" ? "#fcd5da" : "#c3dafe") : "#e5e7eb" }}>
+                        {t === "asg" ? "ASG Hours" : "Service Hours"}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div>
+                <label className={lc}>Title</label>
+                <input className={ic} placeholder="e.g. Wilson Park Cleanup" value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} />
+              </div>
+              <div>
+                <label className={lc}>Description</label>
+                <textarea className={`${ic} resize-none`} rows={2} placeholder="What will members be doing?" value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label className={lc}>Date</label>
+                  <input type="date" className={ic} value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
+                </div>
+                <div className="flex-1">
+                  <label className={lc}>Location</label>
+                  <input className={ic} placeholder="e.g. Wilson Park" value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} />
+                </div>
+              </div>
+
+              {/* Shifts toggle */}
+              <label className="flex items-center gap-2 cursor-pointer p-3 rounded-xl border border-gray-200 bg-gray-50">
+                <input type="checkbox" checked={hasShifts} onChange={e => setHasShifts(e.target.checked)} className="w-4 h-4 rounded accent-red-700" />
+                <span className="text-sm font-semibold text-gray-700">This event has shifts <span className="font-normal text-gray-400">(1 hr each)</span></span>
+              </label>
+
+              {!hasShifts && (
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className={lc}>Time</label>
+                    <input className={ic} placeholder="e.g. 10 AM – 12 PM" value={form.time} onChange={e => setForm(f => ({ ...f, time: e.target.value }))} />
+                  </div>
+                  <div className="flex-1">
+                    <label className={lc}>Spots</label>
+                    <input type="number" className={ic} placeholder="e.g. 12" value={form.spotsTotal} onChange={e => setForm(f => ({ ...f, spotsTotal: e.target.value }))} />
+                  </div>
+                </div>
+              )}
+
+              {!hasShifts && (
+                <div>
+                  <label className={lc}>Hours Credited</label>
+                  <input type="number" className={ic} placeholder="2" value={form.hours} onChange={e => setForm(f => ({ ...f, hours: e.target.value }))} />
+                </div>
+              )}
+
+              {hasShifts && (
+                <div className="space-y-2">
+                  <label className={lc}>Shifts <span className="font-normal text-gray-400">— 1 hr credited each</span></label>
+                  {shifts.map((sh, i) => (
+                    <div key={i} className="flex gap-2 items-center">
+                      <input className={`flex-1 ${ic}`} placeholder="e.g. 1:00–2:00 PM" value={sh.time} onChange={e => updateShift(i, "time", e.target.value)} />
+                      <input type="number" className="w-20 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-red-300" placeholder="Spots" value={sh.spots} onChange={e => updateShift(i, "spots", e.target.value)} />
+                      {shifts.length > 1 && <button onClick={() => removeShift(i)} className="text-gray-300 hover:text-red-400 text-lg font-bold leading-none">×</button>}
+                    </div>
+                  ))}
+                  <button onClick={addShift} className="text-xs font-semibold text-gray-500 hover:text-gray-700 flex items-center gap-1 mt-1">+ Add shift</button>
+                </div>
+              )}
+            </div>
+            <div className="flex gap-3 mt-5">
+              <button onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border border-gray-200 text-gray-700">Cancel</button>
+              <button onClick={handlePost} disabled={!valid}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white"
+                style={{ backgroundColor: UA_RED, opacity: !valid ? 0.5 : 1, cursor: !valid ? "not-allowed" : "pointer" }}>
+                Post Live
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── FLF Staff Panel ───────────────────────────────────────────────────────
+    function FlfStaffView({ flfMembers }) {
+      const [authed, setAuthed] = useState(false);
+      const [pw, setPw] = useState("");
+      const [tab, setTab] = useState("all");
+      const [signups, setSignups] = useState([]);
+      const [outside, setOutside] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [toast, setToast] = useState(null);
+      const [validateTarget, setValidateTarget] = useState(null);
+      const [hoursInput, setHoursInput] = useState("1");
+      const [validating, setValidating] = useState(false);
+      const [selectedMember, setSelectedMember] = useState("");
+      const [memberValidated, setMemberValidated] = useState([]);
+      const [mainTab, setMainTab] = useState("activity");
+      const [sgLeaders, setSgLeaders] = useState([]);
+      const [selectedLeader, setSelectedLeader] = useState("");
+      const [sgMembers, setSgMembers] = useState([]);
+      const [sgLoading, setSgLoading] = useState(false);
+      const [sgEntryMode, setSgEntryMode] = useState(false);
+      const [sgActiveMeeting, setSgActiveMeeting] = useState(1);
+      const [sgDraft, setSgDraft] = useState({});
+      const [sgDrawerMember, setSgDrawerMember] = useState(null);
+
+      const loadAll = useCallback(async () => {
+        setLoading(true);
+        try {
+          const [s, o] = await Promise.all([
+            apiGet("getFlfSignups"),
+            apiGet("getFlfOutsideHours"),
+          ]);
+          if (s.success) setSignups(s.data);
+          if (o.success) setOutside(o.data);
+        } catch (e) {}
+        finally { setLoading(false); }
+      }, []);
+
+      useEffect(() => { if (authed) loadAll(); }, [authed, loadAll]);
+
+      useEffect(() => {
+        if (!selectedMember) { setMemberValidated([]); return; }
+        apiGet("getValidated").then(res => {
+          if (res.success) setMemberValidated(res.data.filter(v => v.name === selectedMember));
+        }).catch(() => {});
+      }, [selectedMember]);
+
+      useEffect(() => {
+        if (!authed) return;
+        apiGet("getSmallGroups").then(res => { if (res.success) setSgLeaders(res.data); }).catch(() => {});
+      }, [authed]);
+
+      useEffect(() => {
+        if (!selectedLeader) { setSgMembers([]); return; }
+        setSgLoading(true);
+        apiGet("getSmallGroup", { leader: selectedLeader }).then(res => {
+          if (res.success) setSgMembers(res.data);
+        }).catch(() => {}).finally(() => setSgLoading(false));
+      }, [selectedLeader]);
+
+      const reloadSgMembers = () => {
+        if (!selectedLeader) return;
+        setSgLoading(true);
+        apiGet("getSmallGroup", { leader: selectedLeader }).then(res => {
+          if (res.success) setSgMembers(res.data);
+        }).catch(() => {}).finally(() => setSgLoading(false));
+      };
+
+      const SG_HOUR_TARGET = 3;
+      const sgHourColor = (h) => h === 0 ? "#dc2626" : h < SG_HOUR_TARGET ? "#d97706" : "#16a34a";
+      const SG_MTG_COLORS = { present: "#16a34a", late: "#d97706", excused: "#1a56db", absent: "#dc2626" };
+      const SG_MTG_BG    = { present: "#F0FFF4", late: "#FFFBEB", excused: "#F0F7FF", absent: "#FFF0F2" };
+
+      const cycleStatus = (current) => {
+        const cycle = ["", "present", "late", "excused", "absent"];
+        return cycle[(cycle.indexOf(current) + 1) % cycle.length];
+      };
+
+      const nextUnmarkedMeeting = (members) => {
+        for (let n = 1; n <= 10; n++) {
+          const key = "meeting" + n;
+          if (!members.some(m => m.meetings && m.meetings[key])) return n;
+        }
+        return 10;
+      };
+
+      const startAttendance = () => {
+        const n = nextUnmarkedMeeting(sgMembers);
+        setSgActiveMeeting(n);
+        const key = "meeting" + n;
+        const draft = {};
+        sgMembers.forEach(m => { draft[m.member] = (m.meetings && m.meetings[key]) || ""; });
+        setSgDraft(draft);
+        setSgEntryMode(true);
+      };
+
+      const saveAttendance = async () => {
+        const meeting = "meeting" + sgActiveMeeting;
+        await Promise.all(Object.entries(sgDraft).map(([memberName, value]) =>
+          apiPost({ action: "markAttendance", leader: selectedLeader, memberName, meeting, value })
+        ));
+        setSgEntryMode(false);
+        reloadSgMembers();
+      };
+
+      const toggleDrawerAttendance = async (meeting, currentVal) => {
+        const newVal = cycleStatus(currentVal);
+        setSgDrawerMember(prev => ({ ...prev, meetings: { ...prev.meetings, [meeting]: newVal } }));
+        setSgMembers(prev => prev.map(m => m.member === sgDrawerMember.member
+          ? { ...m, meetings: { ...m.meetings, [meeting]: newVal },
+              meetingsAttended: Object.entries({ ...m.meetings, [meeting]: newVal })
+                .filter(([k, v]) => k.startsWith("meeting") && ["present","late"].includes(v)).length }
+          : m
+        ));
+        await apiPost({ action: "markAttendance", leader: selectedLeader, memberName: sgDrawerMember.member, meeting, value: newVal });
+      };
+
+      if (!authed) {
+        return (
+          <div className="flex flex-col items-center gap-5 py-20 px-4 max-w-sm mx-auto text-center">
+            <div className="w-14 h-14 rounded-full flex items-center justify-center text-2xl" style={{ backgroundColor: "#F0F7FF" }}>👥</div>
+            <div>
+              <h2 className="text-xl font-bold text-gray-900">FLF Staff Panel</h2>
+              <p className="text-sm text-gray-500 mt-1">Enter your staff password to continue.</p>
+            </div>
+            <input type="password" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+              placeholder="Password" value={pw} onChange={e => setPw(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && pw === "flfstaff2026" && setAuthed(true)} />
+            <button onClick={() => pw === "flfstaff2026" && setAuthed(true)}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold text-white" style={{ backgroundColor: "#1a56db" }}>
+              Sign In
+            </button>
+            {pw && pw !== "flfstaff2026" && <p className="text-xs text-red-500">Incorrect password</p>}
+          </div>
+        );
+      }
+
+      const handleValidateOutside = async () => {
+        if (!validateTarget || !hoursInput) return;
+        setValidating(true);
+        try {
+          const res = await apiPost({
+            action: "validateOutsideHours",
+            outsideId: validateTarget.id,
+            name: validateTarget.name,
+            email: validateTarget.email,
+            type: validateTarget.type,
+            description: validateTarget.description,
+            hours: hoursInput,
+          });
+          if (res.success) {
+            setToast({ message: `${hoursInput} hr(s) credited to ${validateTarget.name}`, color: "#22c55e" });
+            setValidateTarget(null);
+            loadAll();
+          } else {
+            setToast({ message: res.error || "Something went wrong.", color: "#ef4444" });
+          }
+        } catch (e) {
+          setToast({ message: "Could not connect.", color: "#ef4444" });
+        } finally {
+          setValidating(false);
+        }
+      };
+
+      // Filtered data for member view
+      const memberSignups = selectedMember ? signups.filter(s => s.name === selectedMember) : signups;
+      const memberOutside = selectedMember ? outside.filter(o => o.name === selectedMember) : outside;
+
+      // Combined activity for member view
+      const combinedActivity = selectedMember ? [
+        ...memberSignups.map(s => ({ ...s, _kind: "signup" })),
+        ...memberOutside.map(o => ({ ...o, _kind: "outside" })),
+      ] : [];
+
+      const asgHours = memberValidated.filter(v => v.type === "asg").reduce((a, v) => a + (Number(v.hours) || 0), 0);
+      const serviceHours = memberValidated.filter(v => v.type === "service").reduce((a, v) => a + (Number(v.hours) || 0), 0);
+
+      return (
+        <div className="max-w-2xl mx-auto px-4 py-6">
+          {toast && <Toast message={toast.message} color={toast.color} onDone={() => setToast(null)} />}
+
+          {validateTarget && (
+            <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+              <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm">
+                <h3 className="font-bold text-lg text-gray-900 mb-1">Validate Outside Hours</h3>
+                <p className="text-sm text-gray-500 mb-1">{validateTarget.name} · {validateTarget.email}</p>
+                {validateTarget.description && <p className="text-xs text-gray-400 italic mb-4">"{validateTarget.description}"</p>}
+                <label className="text-xs font-semibold text-gray-600 block mb-1">Hours to credit</label>
+                <input type="number" min="0.5" step="0.5"
+                  className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300 mb-5"
+                  value={hoursInput} onChange={e => setHoursInput(e.target.value)} />
+                <div className="flex gap-3">
+                  <button onClick={() => setValidateTarget(null)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border border-gray-200 text-gray-700">Cancel</button>
+                  <button onClick={handleValidateOutside} disabled={validating || !hoursInput}
+                    className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2"
+                    style={{ backgroundColor: "#1a56db", opacity: !hoursInput ? 0.5 : 1 }}>
+                    {validating ? <><Spinner size={14} /> Saving...</> : "Credit Hours"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900">FLF Staff Panel</h2>
+              <p className="text-sm text-gray-500">Member service activity</p>
+            </div>
+            <button onClick={loadAll} className="p-2 rounded-xl border border-gray-200 hover:bg-gray-50" title="Refresh">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2.5" strokeLinecap="round"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>
+            </button>
+          </div>
+
+          {/* Main tabs */}
+          <div className="flex gap-1 bg-gray-100 rounded-xl p-1 text-sm font-semibold mb-5">
+            {[["activity", "Activity"], ["smallgroups", "Small Groups"]].map(([id, label]) => (
+              <button key={id} onClick={() => setMainTab(id)} className="flex-1 py-2 rounded-lg transition-all"
+                style={{ backgroundColor: mainTab === id ? "white" : "transparent", color: mainTab === id ? "#1a56db" : "#6b7280", boxShadow: mainTab === id ? "0 1px 3px rgba(0,0,0,0.1)" : "none" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* ── Small Groups Tab — Review Mode ── */}
+          {mainTab === "smallgroups" && !sgEntryMode && (
+            <div>
+              {/* Leader picker */}
+              <div className="mb-5">
+                <label className="text-xs font-semibold text-gray-500 block mb-1.5">Select small group leader</label>
+                <select className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300 bg-white"
+                  value={selectedLeader} onChange={e => { setSelectedLeader(e.target.value); setSgDrawerMember(null); }}>
+                  <option value="">-- Select a leader --</option>
+                  {sgLeaders.map(l => <option key={l} value={l}>{l}</option>)}
+                </select>
+              </div>
+
+              {sgLoading && <LoadingScreen message="Loading group..." />}
+              {!sgLoading && selectedLeader && sgMembers.length === 0 && (
+                <div className="text-center py-12 text-gray-400"><p className="text-3xl mb-2">👥</p><p className="font-medium">No members in this group yet</p></div>
+              )}
+
+              {!sgLoading && sgMembers.length > 0 && (
+                <>
+                  {/* Group header */}
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <h3 className="font-bold text-gray-900 text-lg">{selectedLeader.split(" ")[0]}'s small group</h3>
+                      <p className="text-xs text-gray-400">{sgMembers.length} members</p>
+                    </div>
+                    <button onClick={startAttendance}
+                      className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-white"
+                      style={{ backgroundColor: "#1a56db" }}>
+                      Take attendance →
+                    </button>
+                  </div>
+
+                  {/* Member rows */}
+                  <div className="space-y-2 mb-4">
+                    {sgMembers.map((m, i) => {
+                      const sc = sgHourColor(m.serviceHours);
+                      const ac = sgHourColor(m.asgHours);
+                      const borderColor = m.serviceHours === 0 ? "#fca5a5" : m.serviceHours < SG_HOUR_TARGET ? "#fde68a" : "#86efac";
+                      return (
+                        <div key={i} className="bg-white rounded-2xl border shadow-sm p-4" style={{ borderColor }}>
+                          <div className="flex items-center gap-3">
+                            <div className="flex-1 min-w-0">
+                              <p className="font-semibold text-gray-900 text-sm mb-2">{m.member}</p>
+                              <div className="space-y-1.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs text-gray-400 w-12 shrink-0">Service</span>
+                                  <div className="flex-1 bg-gray-100 rounded-full h-1.5">
+                                    <div className="h-1.5 rounded-full transition-all" style={{ width: `${Math.min(m.serviceHours / SG_HOUR_TARGET * 100, 100)}%`, backgroundColor: sc }} />
+                                  </div>
+                                  <span className="text-xs font-bold w-8 text-right" style={{ color: sc }}>{m.serviceHours}/{SG_HOUR_TARGET}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs text-gray-400 w-12 shrink-0">ASG</span>
+                                  <div className="flex-1 bg-gray-100 rounded-full h-1.5">
+                                    <div className="h-1.5 rounded-full transition-all" style={{ width: `${Math.min(m.asgHours / SG_HOUR_TARGET * 100, 100)}%`, backgroundColor: ac }} />
+                                  </div>
+                                  <span className="text-xs font-bold w-8 text-right" style={{ color: ac }}>{m.asgHours}/{SG_HOUR_TARGET}</span>
+                                </div>
+                              </div>
+                            </div>
+                            {/* Meeting squares */}
+                            <div className="flex flex-col items-end gap-1.5 shrink-0">
+                              <div className="flex items-center gap-0.5">
+                                {[1,2,3,4,5,6,7,8,9,10].map(n => {
+                                  const status = m.meetings && m.meetings["meeting" + n];
+                                  return (
+                                    <div key={n} className="w-3.5 h-3.5 rounded-sm"
+                                      style={{ backgroundColor: status ? SG_MTG_COLORS[status] : "#e5e7eb" }}
+                                      title={`Meeting ${n}: ${status || "not yet held"}`} />
+                                  );
+                                })}
+                                <button onClick={() => setSgDrawerMember(m)} className="ml-1 text-gray-400 hover:text-blue-500 text-base font-bold leading-none">›</button>
+                              </div>
+                              <span className="text-xs text-gray-400">{m.meetingsAttended} of 10 attended</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Legend */}
+                  <div className="flex flex-wrap gap-3 text-xs text-gray-500">
+                    {[["#16a34a","Present"],["#d97706","Late"],["#1a56db","Excused"],["#dc2626","Absent"],["#e5e7eb","Not yet held"]].map(([c,l]) => (
+                      <span key={l} className="flex items-center gap-1">
+                        <span className="w-3 h-3 rounded-sm inline-block" style={{ backgroundColor: c }} />
+                        {l}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {/* Member drawer */}
+              {sgDrawerMember && (
+                <div className="fixed inset-0 bg-black/30 z-50 flex justify-end" onClick={() => setSgDrawerMember(null)}>
+                  <div className="w-80 bg-white h-full shadow-2xl p-5 overflow-y-auto flex flex-col gap-4" onClick={e => e.stopPropagation()}>
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-0.5">{selectedLeader.split(" ")[0]}'s group</p>
+                        <h3 className="font-bold text-gray-900 text-lg">{sgDrawerMember.member}</h3>
+                      </div>
+                      <button onClick={() => setSgDrawerMember(null)} className="text-gray-400 hover:text-gray-600 text-xl font-bold leading-none">×</button>
+                    </div>
+
+                    {/* Hours block */}
+                    <div className="bg-gray-50 rounded-2xl p-4 space-y-3">
+                      <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">Hours — semester total</p>
+                      {[["Service", sgDrawerMember.serviceHours], ["ASG", sgDrawerMember.asgHours]].map(([label, h]) => {
+                        const c = sgHourColor(h);
+                        return (
+                          <div key={label} className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-gray-500">{label}</span>
+                              <span className="font-bold" style={{ color: c }}>{h} of {SG_HOUR_TARGET}</span>
+                            </div>
+                            <div className="w-full bg-gray-200 rounded-full h-2">
+                              <div className="h-2 rounded-full" style={{ width: `${Math.min(h / SG_HOUR_TARGET * 100, 100)}%`, backgroundColor: c }} />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Meeting record block */}
+                    <div className="bg-gray-50 rounded-2xl p-4">
+                      <p className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-3">Meeting record</p>
+                      <p className="text-xs text-gray-400 mb-3">{sgDrawerMember.meetingsAttended} of 10 attended · tap to amend</p>
+                      <div className="grid grid-cols-5 gap-2">
+                        {[1,2,3,4,5,6,7,8,9,10].map(n => {
+                          const key = "meeting" + n;
+                          const status = sgDrawerMember.meetings && sgDrawerMember.meetings[key];
+                          const bg = status ? SG_MTG_BG[status] : "#f3f4f6";
+                          const color = status ? SG_MTG_COLORS[status] : "#9ca3af";
+                          return (
+                            <button key={n} onClick={() => toggleDrawerAttendance(key, status || "")}
+                              className="rounded-xl py-2 flex flex-col items-center gap-0.5 transition-all"
+                              style={{ backgroundColor: bg }}>
+                              <span className="text-xs font-bold" style={{ color }}>{n}</span>
+                              <span className="text-[9px] font-semibold" style={{ color }}>{status ? status.slice(0,2).toUpperCase() : "—"}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Small Groups Tab — Entry Mode ── */}
+          {mainTab === "smallgroups" && sgEntryMode && (
+            <div>
+              {/* Dark header */}
+              <div className="rounded-2xl p-4 mb-4" style={{ backgroundColor: "#111827" }}>
+                <p className="text-xs font-bold uppercase tracking-widest mb-2" style={{ color: "#fbbf24" }}>Taking Attendance — nothing else editable</p>
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <span className="text-white font-bold text-lg">Meeting {sgActiveMeeting}</span>
+                    <select className="text-xs rounded-lg px-2 py-1 border-0 font-semibold"
+                      style={{ backgroundColor: "#374151", color: "white" }}
+                      value={sgActiveMeeting}
+                      onChange={e => {
+                        const n = Number(e.target.value);
+                        setSgActiveMeeting(n);
+                        const key = "meeting" + n;
+                        const draft = {};
+                        sgMembers.forEach(m => { draft[m.member] = (m.meetings && m.meetings[key]) || ""; });
+                        setSgDraft(draft);
+                      }}>
+                      {[1,2,3,4,5,6,7,8,9,10].map(n => <option key={n} value={n}>Meeting {n}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => setSgEntryMode(false)}
+                      className="text-sm font-semibold px-3 py-1.5 rounded-lg"
+                      style={{ backgroundColor: "#374151", color: "#d1d5db" }}>
+                      Cancel
+                    </button>
+                    <button onClick={() => { const d = {}; sgMembers.forEach(m => { d[m.member] = "present"; }); setSgDraft(d); }}
+                      className="text-sm font-semibold px-3 py-1.5 rounded-lg"
+                      style={{ backgroundColor: "#374151", color: "white" }}>
+                      Mark all present
+                    </button>
+                    <button onClick={saveAttendance}
+                      className="text-sm font-semibold px-3 py-1.5 rounded-lg text-white"
+                      style={{ backgroundColor: "#1a56db" }}>
+                      Save {Object.values(sgDraft).filter(v => v).length} of {sgMembers.length}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Member chips */}
+              <div className="space-y-2">
+                {sgMembers.map((m, i) => {
+                  const status = sgDraft[m.member] || "";
+                  const chipStyle = status
+                    ? { backgroundColor: SG_MTG_BG[status], color: SG_MTG_COLORS[status] }
+                    : { backgroundColor: "#f3f4f6", color: "#9ca3af" };
+                  const label = status ? status.charAt(0).toUpperCase() + status.slice(1) : "Not marked";
+                  return (
+                    <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm px-4 py-3 flex items-center justify-between">
+                      <p className="font-semibold text-gray-900 text-sm">{m.member}</p>
+                      <button onClick={() => setSgDraft(prev => ({ ...prev, [m.member]: cycleStatus(status) }))}
+                        className="text-sm font-semibold px-4 py-1.5 rounded-full transition-all"
+                        style={chipStyle}>
+                        {label}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-gray-400 text-center mt-4">Tap a chip to cycle: present → late → excused → absent → clear</p>
+            </div>
+          )}
+
+          {mainTab === "activity" && <div>
+          <div className="mb-5">
+            <label className="text-xs font-semibold text-gray-500 block mb-1.5">View by member</label>
+            <select className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300 bg-white"
+              value={selectedMember} onChange={e => { setSelectedMember(e.target.value); setTab(e.target.value ? "member" : "all"); }}>
+              <option value="">-- All members --</option>
+              {(flfMembers || []).map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </div>
+
+          {/* Stats */}
+          {!selectedMember && (
+            <div className="grid grid-cols-2 gap-3 mb-5">
+              {[
+                { label: "FLF Signups", value: signups.length, icon: "📋", color: UA_RED },
+                { label: "Outside Hours", value: outside.length, icon: "📝", color: "#1a56db" },
+              ].map((s, i) => (
+                <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-3 text-center">
+                  <p className="text-xl mb-0.5">{s.icon}</p>
+                  <p className="text-2xl font-bold" style={{ color: s.color }}>{loading ? "—" : s.value}</p>
+                  <p className="text-xs text-gray-400 mt-0.5">{s.label}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {selectedMember && (
+            <div className="bg-blue-50 border border-blue-100 rounded-2xl p-4 mb-5">
+              <div className="flex items-start justify-between mb-3">
+                <p className="font-semibold text-gray-900">{selectedMember}</p>
+                <button onClick={() => { setSelectedMember(""); setTab("all"); }} className="text-xs text-blue-600 font-semibold underline">Back</button>
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1 bg-white rounded-xl p-3 text-center border border-red-100">
+                  <p className="text-2xl font-bold" style={{ color: UA_RED }}>{asgHours}</p>
+                  <p className="text-xs text-gray-500 mt-0.5">ASG Hours</p>
+                </div>
+                <div className="flex-1 bg-white rounded-xl p-3 text-center border border-blue-100">
+                  <p className="text-2xl font-bold text-blue-600">{serviceHours}</p>
+                  <p className="text-xs text-gray-500 mt-0.5">Service Hours</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Tabs — only show when no member selected */}
+          {!selectedMember && (
+            <div className="flex gap-1 bg-gray-100 rounded-xl p-1 text-sm font-semibold mb-5">
+              {[["all-signups", `Event Signups (${signups.length})`], ["all-outside", `Outside Hours (${outside.length})`]].map(([id, label]) => (
+                <button key={id} onClick={() => setTab(id)} className="flex-1 py-2 rounded-lg transition-all"
+                  style={{ backgroundColor: tab === id ? "white" : "transparent", color: tab === id ? "#1a56db" : "#6b7280", boxShadow: tab === id ? "0 1px 3px rgba(0,0,0,0.1)" : "none" }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {loading && <LoadingScreen />}
+
+          {/* Member combined view */}
+          {!loading && selectedMember && (
+            <div className="space-y-3">
+              {combinedActivity.length === 0 ? (
+                <div className="text-center py-12 text-gray-400"><p className="text-3xl mb-2">📋</p><p className="font-medium">No activity recorded for {selectedMember}</p></div>
+              ) : combinedActivity.map((item, i) => {
+                if (item._kind === "signup") {
+                  const isValidated = String(item.validated).toUpperCase() === "TRUE";
+                  return (
+                    <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="font-semibold text-sm text-gray-900">{item.opportunityTitle}</p>
+                        <div className="flex items-center gap-2">
+                          <Badge type={item.opportunityType || "service"} />
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${isValidated ? "bg-green-50 text-green-700 border border-green-100" : "bg-yellow-50 text-yellow-700 border border-yellow-100"}`}>
+                            {isValidated ? "Validated" : "Pending"}
+                          </span>
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-400">Event signup · {item.timestamp}</p>
+                    </div>
+                  );
+                } else {
+                  const isValidated = String(item.status).toLowerCase() === "validated";
+                  return (
+                    <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="font-semibold text-sm text-gray-900">{item.description || "Outside Hours"}</p>
+                        <div className="flex items-center gap-2">
+                          <Badge type={item.type} />
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${isValidated ? "bg-green-50 text-green-700 border border-green-100" : "bg-yellow-50 text-yellow-700 border border-yellow-100"}`}>
+                            {isValidated ? "Validated" : "Pending"}
+                          </span>
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-400">Outside hours · Correspondent: {item.correspondent}</p>
+                      {!isValidated && (
+                        <button onClick={() => { setValidateTarget(item); setHoursInput("1"); }}
+                          className="mt-3 w-full py-2 rounded-xl text-xs font-semibold text-white"
+                          style={{ backgroundColor: "#1a56db" }}>
+                          Validate & Credit Hours
+                        </button>
+                      )}
+                    </div>
+                  );
+                }
+              })}
+            </div>
+          )}
+
+          {/* All signups tab */}
+          {!loading && !selectedMember && tab === "all-signups" && (
+            <div className="space-y-3">
+              {signups.length === 0 ? (
+                <div className="text-center py-12 text-gray-400"><p className="text-3xl mb-2">📋</p><p className="font-medium">No FLF signups yet</p></div>
+              ) : signups.map((s, i) => (
+                <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                  <div className="flex items-center justify-between mb-1">
+                    <p className="font-semibold text-sm text-gray-900">{s.name}</p>
+                    <div className="flex items-center gap-2">
+                      <Badge type={s.opportunityType || "service"} />
+                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${String(s.validated).toUpperCase() === "TRUE" ? "bg-green-50 text-green-700 border border-green-100" : "bg-yellow-50 text-yellow-700 border border-yellow-100"}`}>
+                        {String(s.validated).toUpperCase() === "TRUE" ? "Validated" : "Pending"}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="text-xs text-gray-400">{s.email}</p>
+                  <p className="text-xs text-gray-500 mt-1">{s.opportunityTitle} · {s.timestamp}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* All outside hours tab */}
+          {!loading && !selectedMember && tab === "all-outside" && (
+            <div className="space-y-3">
+              {outside.length === 0 ? (
+                <div className="text-center py-12 text-gray-400"><p className="text-3xl mb-2">📝</p><p className="font-medium">No outside hours submitted yet</p></div>
+              ) : outside.map((o, i) => {
+                const isValidated = String(o.status).toLowerCase() === "validated";
+                return (
+                  <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="font-semibold text-sm text-gray-900">{o.name}</p>
+                      <div className="flex items-center gap-2">
+                        <Badge type={o.type} />
+                        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${isValidated ? "bg-green-50 text-green-700 border border-green-100" : "bg-yellow-50 text-yellow-700 border border-yellow-100"}`}>
+                          {isValidated ? "Validated" : "Pending"}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-400">{o.email}</p>
+                    {o.description && <p className="text-xs text-gray-500 mt-1 italic">"{o.description}"</p>}
+                    <p className="text-xs text-gray-400 mt-1">Correspondent: {o.correspondent}</p>
+                    {!isValidated && (
+                      <button onClick={() => { setValidateTarget(o); setHoursInput("1"); }}
+                        className="mt-3 w-full py-2 rounded-xl text-xs font-semibold text-white"
+                        style={{ backgroundColor: "#1a56db" }}>
+                        Validate & Credit Hours
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          </div>}
+        </div>
+      );
+    }
+
+    // ── App Shell ─────────────────────────────────────────────────────────────
+    function App() {
+      const [view, setView] = useState("home");
+      const [flfMembers, setFlfMembers] = useState([]);
+      const navItems = [{ id: "home", label: "Home" }, { id: "browse", label: "Opportunities" }];
+
+      useEffect(() => {
+        apiGet("getFlfMembers").then(res => {
+          if (res.success) setFlfMembers(res.data);
+        }).catch(() => {});
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-gray-50">
+          <header className="bg-white border-b border-gray-100 sticky top-0 z-40">
+            <div className="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+              <button onClick={() => setView("home")} className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg flex items-center justify-center text-white text-xs font-bold" style={{ backgroundColor: UA_RED }}>ASG</div>
+                <span className="font-semibold text-gray-900 text-sm">Service Portal</span>
+              </button>
+              <nav className="flex gap-1">
+                {navItems.map(item => (
+                  <button key={item.id} onClick={() => setView(item.id)} className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
+                    style={{ backgroundColor: view === item.id ? "#FFF0F2" : "transparent", color: view === item.id ? UA_RED : "#6b7280" }}>
+                    {item.label}
+                  </button>
+                ))}
+              </nav>
+            </div>
+          </header>
+          <main>
+            {view === "home" && <HomeView setView={setView} />}
+            {view === "browse" && <BrowseView setView={setView} flfMembers={flfMembers} />}
+            {view === "admin" && <AdminView />}
+            {view === "staff" && <FlfStaffView flfMembers={flfMembers} />}
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
