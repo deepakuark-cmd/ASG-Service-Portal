@@ -1190,6 +1190,13 @@
         }).catch(() => {});
       }, [selectedMember]);
 
+      const reloadMemberValidated = () => {
+        if (!selectedMember) return;
+        apiGet("getValidated").then(res => {
+          if (res.success) setMemberValidated(res.data.filter(v => v.name === selectedMember));
+        }).catch(() => {});
+      };
+
       useEffect(() => {
         if (!authed) return;
         apiGet("getSmallGroups").then(res => { if (res.success) setSgLeaders(res.data); }).catch(() => {});
@@ -1241,11 +1248,20 @@
 
       const saveAttendance = async () => {
         const meeting = "meeting" + sgActiveMeeting;
-        await Promise.all(Object.entries(sgDraft).map(([memberName, value]) =>
-          apiPost({ action: "markAttendance", leader: selectedLeader, memberName, meeting, value })
-        ));
-        setSgEntryMode(false);
-        reloadSgMembers();
+        try {
+          const results = await Promise.all(Object.entries(sgDraft).map(([memberName, value]) =>
+            apiPost({ action: "markAttendance", leader: selectedLeader, memberName, meeting, value })
+          ));
+          const failed = results.filter(r => !r.success);
+          if (failed.length > 0) {
+            setToast({ message: `${failed.length} save(s) failed — your changes are preserved. Try again.`, color: "#ef4444" });
+          } else {
+            setSgEntryMode(false);
+            reloadSgMembers();
+          }
+        } catch (e) {
+          setToast({ message: "Could not connect. Your changes are preserved — try again.", color: "#ef4444" });
+        }
       };
 
       const toggleDrawerAttendance = async (meeting, currentVal) => {
@@ -1297,6 +1313,7 @@
             setToast({ message: `${hoursInput} hr(s) credited to ${validateTarget.name}`, color: "#22c55e" });
             setValidateTarget(null);
             loadAll();
+            reloadMemberValidated();
           } else {
             setToast({ message: res.error || "Something went wrong.", color: "#ef4444" });
           }
@@ -1799,4 +1816,3 @@
   </script>
 </body>
 </html>
-
