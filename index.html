@@ -124,6 +124,62 @@
       );
     }
 
+
+    // Public rosters are fetched only while expanded; no signup details are cached.
+    function PublicSignupList({ opportunityId }) {
+      const [expanded, setExpanded] = useState(false);
+      const [retry, setRetry] = useState(0);
+      const [state, setState] = useState({ loading: true, names: [], error: "" });
+      const panelId = React.useId();
+
+      useEffect(() => {
+        if (!expanded) return;
+        let cancelled = false;
+        setState({ loading: true, names: [], error: "" });
+        apiGet("getPublicSignups", { opportunityId }).then(res => {
+          if (!res.success || !Array.isArray(res.data)) throw new Error("Could not load signups.");
+          const names = res.data.map(row => String(row.name || ""))
+            .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
+          if (!cancelled) setState({ loading: false, names, error: "" });
+        }).catch(() => {
+          if (!cancelled) setState({ loading: false, names: [], error: "Could not load signups. Please try again." });
+        });
+        return () => { cancelled = true; };
+      }, [expanded, opportunityId, retry]);
+
+      const toggle = () => {
+        // Clear old results immediately so reopening never flashes a stale roster.
+        setState({ loading: true, names: [], error: "" });
+        setExpanded(value => !value);
+      };
+
+      return (
+        <div className="mt-3 w-full min-w-0 border-t border-gray-200 pt-2">
+          <button type="button" onClick={toggle} aria-expanded={expanded} aria-controls={panelId}
+            className="min-h-[44px] text-sm font-semibold text-gray-600 rounded-lg px-1 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-700">
+            <span aria-hidden="true">{expanded ? "▾" : "▸"} </span>Who’s signed up?
+          </button>
+          <div id={panelId} hidden={!expanded} aria-live="polite" aria-busy={expanded && state.loading}>
+            {expanded && (state.loading ? (
+              <p className="text-sm text-gray-500 py-2">Loading signups...</p>
+            ) : state.error ? (
+              <div className="py-2">
+                <p className="text-sm text-red-700">{state.error}</p>
+                <button type="button" onClick={() => { setState({ loading: true, names: [], error: "" }); setRetry(n => n + 1); }}
+                  className="min-h-[44px] text-sm font-semibold text-red-700 underline">Retry</button>
+              </div>
+            ) : state.names.length === 0 ? (
+              <p className="text-sm text-gray-500 py-2">No one has signed up yet</p>
+            ) : (
+              <ul className="list-disc pl-5 pb-2 space-y-1 text-sm text-gray-700">
+                {state.names.map((name, index) => <li key={index} className="break-words">{name}</li>)}
+              </ul>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
     // ── Home ──────────────────────────────────────────────────────────────────
     function HomeView({ setView }) {
       const [opps, setOpps] = useState([]);
@@ -471,7 +527,7 @@
           )}
 
           {/* ── Sticky Sidebar ── */}
-          <div style={{ width: 200, flexShrink: 0, position: "sticky", top: 56, height: "calc(100vh - 56px)", overflowY: "auto", padding: "28px 12px", borderRight: "1px solid #f3f4f6" }}>
+          <div className="w-28 sm:w-[200px]" style={{ flexShrink: 0, position: "sticky", top: 56, height: "calc(100vh - 56px)", overflowY: "auto", padding: "28px 12px", borderRight: "1px solid #f3f4f6" }}>
             <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 px-3">Filter</p>
             <div className="space-y-0.5 mb-5">
               <SidebarBtn active={filter === "all" && avail === "all"} onClick={() => { setFilter("all"); setAvail("all"); }}>
@@ -501,7 +557,7 @@
           </div>
 
           {/* ── Main content ── */}
-          <div style={{ flex: 1, padding: "28px 28px", minWidth: 0 }}>
+          <div className="flex-1 min-w-0 px-3 py-7 sm:px-7">
             <div className="mb-5">
               <h2 className="text-2xl font-bold text-gray-900">What's open</h2>
               {!loading && (
@@ -532,7 +588,7 @@
                   return (
                     <div key={opp.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-shadow">
                       {/* Main row */}
-                      <div className="flex items-start gap-4">
+                      <div className="flex flex-col sm:flex-row items-start gap-4">
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 mb-1 flex-wrap">
                             <h3 className="font-semibold text-gray-900 text-base leading-snug">{opp.title}</h3>
@@ -567,6 +623,8 @@
                         )}
                       </div>
 
+                      {!hasShifts && <PublicSignupList opportunityId={opp.id} />}
+
                       {/* Shifts section */}
                       {hasShifts && (
                         <div className="mt-3 space-y-2">
@@ -576,7 +634,8 @@
                             const shiftFull = shiftLeft <= 0;
                             const shiftPct = Number(shift.spotsTotal) > 0 ? Math.min(Number(shift.spotsFilled) / Number(shift.spotsTotal) * 100, 100) : 0;
                             return (
-                              <div key={shift.id} className="flex items-center gap-3 bg-gray-50 rounded-xl px-3 py-2">
+                              <div key={shift.id} className="bg-gray-50 rounded-xl px-3 py-2">
+                                <div className="flex items-center gap-3">
                                 <div className="flex-1 min-w-0">
                                   <p className="text-sm font-medium text-gray-700">{shift.time}</p>
                                   <div className="flex items-center gap-2 mt-1">
@@ -593,6 +652,8 @@
                                   style={{ backgroundColor: shiftFull ? "#e5e7eb" : UA_RED, color: shiftFull ? "#9ca3af" : "white", cursor: shiftFull ? "not-allowed" : "pointer" }}>
                                   {shiftFull ? "Full" : "Sign up"}
                                 </button>
+                                </div>
+                                <PublicSignupList opportunityId={shift.id} />
                               </div>
                             );
                           })}
@@ -1738,3 +1799,4 @@
   </script>
 </body>
 </html>
+
